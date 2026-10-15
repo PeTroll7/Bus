@@ -3,24 +3,31 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MHD Kolejní - Živý Stream</title>
+    <title>MHD Kolejní</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
         body { margin: 0; padding: 0; font-family: sans-serif; }
         #map { width: 100vw; height: 100vh; }
-        #status {
+        #panel {
             position: absolute; top: 10px; left: 50px; right: 10px; z-index: 1000;
-            background: rgba(255,255,255,0.95); padding: 8px 12px;
-            border-radius: 6px; border: 2px solid #333; font-size: 13px; font-weight: bold;
+            background: rgba(255,255,255,0.96); padding: 10px;
+            border-radius: 6px; border: 2px solid #222; font-size: 12px;
+            max-height: 40vh; overflow-y: auto; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
         }
+        #status { font-weight: bold; font-size: 13px; margin-bottom: 4px; }
+        #log { margin: 0; font-family: monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; color: #444; }
         .bus-icon {
             background: #0056b3; color: #fff; border-radius: 4px; padding: 2px 5px;
             font-size: 11px; font-weight: bold; border: 1px solid #fff; white-space: nowrap;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.5);
         }
     </style>
 </head>
 <body>
-    <div id="status">Připojuji se k živému streamu Brna...</div>
+    <div id="panel">
+        <div id="status">Spouštím diagnostiku spojení...</div>
+        <pre id="log"></pre>
+    </div>
     <div id="map"></div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -43,92 +50,155 @@
         L.circle([LAT, LON], { color: '#d9534f', weight: 1, fillOpacity: 0.05, radius: RADIUS }).addTo(map);
 
         const statusEl = document.getElementById('status');
-        const markers = {}; // Uchovává aktivní vozy podle jejich ID
+        const logEl = document.getElementById('log');
+        const markers = {};
 
-        // Výpočet obdélníku (BBOX) kolem Kolejní, aby server posílal jen blízká vozidla
-        const latD = RADIUS / 111320;
-        const lonD = RADIUS / (111320 * Math.cos(LAT * Math.PI / 180));
-        const filterEnvelope = {
-            xmin: LON - lonD, ymin: LAT - latD,
-            xmax: LON + lonD, ymax: LAT + latD,
-            spatialReference: { wkid: 4326 }
-        };
+        function addLog(msg) {
+            logEl.innerText = msg;
+        }
 
-        let ws;
-        function connectStream() {
-            // Oficiální WebSocket StreamServer města Brna (KORDIS)
-            const wsUrl = 'wss://gis.brno.cz/ags4/rest/services/stream_kordis_26/StreamServer/subscribe?outSR=4326';
-            ws = new WebSocket(wsUrl);
+        function updateVehicleOnMap(lat, lon, props) {
+            if (!lat || !lon) return;
+            const dist = map.distance([LAT, LON], [lat, lon]);
+
+            // Atributy podle dokumentace NKOD (id, lineid/linename, delay, finalstopname)
+            const id = props.id || props.ID || props.VehicleId || `${props.lineid}_${props.course}`;
+            const line = props.linename || props.LineName || props.lineid || props.LineId || '?';
+            const delay = props.delay ?? props.Delay ?? 0;
+
+            if (dist <= RADIUS) {
+                const icon = L.divIcon({
+                    className: '',
+                    html: `<div class="bus-icon">${line}</div>`,
+                    iconSize: [28, 18], iconAnchor: [14, 9]
+                });
+                const popup = `<b>Linka ${line}</b><br>Vůz ID: ${id}<br>Zpoždění: ${delay} min<br>Vzdálenost: ${Math.round(dist)} m`;
+
+                if (markers[id]) {
+                    markers[id].setLatLng([lat, lon]).setIcon(icon).setPopupContent(popup);
+                } else {
+                    markers[id] = L.marker([lat, lon], { icon }).addTo(map).bindPopup(popup);
+                }
+            } else if (markers[id]) {
+                map.removeLayer(markers[id]);
+                delete markers[id];
+            }
+            statusEl.innerText = `🟢 Aktivní (${Object.keys(markers).length} vozů v okruhu 1,5 km)`;
+            statusEl.style.color = '#198754';
+        }
+
+        async function initConnection() {
+            const diagnostics = {};
+
+            // 1. Získání skutečné WebSocket adresy z StreamServer metadat
+            try {
+                statusEl.innerText = '1/2 Načítám konfiguraci StreamServeru...';
+                const streamMetaUrl = 'https://gis.brno.cz/ags4/rest/services/stream_kordis_26/StreamServer?f=json';
+                const res = await fetch(streamMetaUrl);
+                const meta = await res.json();
+                diagnostics.streamMeta = meta;
+
+                if (meta.streamUrls && meta.streamUrls.length > 0) {
+                    const wsBlock = meta.streamUrls.find(u => u.transport === 'ws') || meta.streamUrls[0];
+                    if (wsBlock && wsBlock.urls && wsBlock.urls.length > 0) {
+                        // Přidáme outSR=4326, aby souřadnice chodily v GPS stupních (WGS84) a ne v S-JTSK
+                        let wsUrl = wsBlock.urls[0];
+                        wsUrl += (wsUrl.includes('?') ? '&' : '?') + 'outSR=4326';
+                        
+                        connectWebSocket(wsUrl, meta);
+                        return;
+                    }
+                }
+            } catch (e) {
+                diagnostics.streamMetaError = e.message;
+            }
+
+            // 2. Záložní pokus: Získání REST FeatureServeru přes oficiální ID (852ec5db62ad41c8a5f92405c1916c6b)
+            try {
+                statusEl.innerText = '2/2 Hledám záložní FeatureServer (ID 852ec5db...)...';
+                const itemUrl = 'https://www.arcgis.com/sharing/rest/content/items/852ec5db62ad41c8a5f92405c1916c6b?f=json';
+                const res = await fetch(itemUrl);
+                const itemData = await res.json();
+                diagnostics.arcgisItem = { title: itemData.title, url: itemData.url, type: itemData.type };
+
+                if (itemData.url) {
+                    if (itemData.url.includes('StreamServer')) {
+                        const r2 = await fetch(itemData.url + '?f=json');
+                        const m2 = await r2.json();
+                        const wsUrl = m2.streamUrls?.[0]?.urls?.[0];
+                        if (wsUrl) {
+                            connectWebSocket(wsUrl + '?outSR=4326', m2);
+                            return;
+                        }
+                    } else {
+                        startRestPolling(itemData.url);
+                        return;
+                    }
+                }
+            } catch (e) {
+                diagnostics.arcgisItemError = e.message;
+            }
+
+            statusEl.innerText = '❌ Nepodařilo se navázat spojení';
+            statusEl.style.color = '#b00000';
+            addLog(JSON.stringify(diagnostics, null, 2));
+        }
+
+        function connectWebSocket(wsUrl, metaInfo) {
+            statusEl.innerText = 'Připojuji WebSocket...';
+            addLog(`WS URL: ${wsUrl}`);
+
+            const ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
-                statusEl.innerText = '🟢 Připojeno – čekám na pohyb vozidel v okolí...';
+                statusEl.innerText = '🟢 Stream připojen – čekám na vysílání vozů...';
                 statusEl.style.color = '#198754';
-                // Požádáme server, aby filtroval data jen pro okolí Kolejní
-                ws.send(JSON.stringify({ filter: { geometry: filterEnvelope } }));
+                logEl.innerText = ''; // Skryje log, když vše funguje
             };
 
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     if (!data.geometry) return;
-
-                    const lon = data.geometry.x;
-                    const lat = data.geometry.y;
-                    if (!lat || !lon) return;
-
-                    const dist = map.distance([LAT, LON], [lat, lon]);
-                    const props = data.attributes || {};
-                    const id = props.ID || props.VehicleId || props.id || `${ props.LineName }_${ props.Course }`;
-
-                    if (dist <= RADIUS) {
-                        const line = props.LineName || props.line_name || props.LineId || '?';
-                        const delay = props.Delay ?? props.delay ?? 0;
-                        const finalStop = props.FinalStopName || '';
-
-                        const icon = L.divIcon({
-                            className: '',
-                            html: `<div class="bus-icon">${line}</div>`,
-                            iconSize: [28, 18], iconAnchor: [14, 9]
-                        });
-
-                        const popup = `<b>Linka ${line}</b><br>Směr: ${finalStop}<br>Zpoždění: ${delay} min`;
-
-                        if (markers[id]) {
-                            markers[id].setLatLng([lat, lon]).setIcon(icon).setPopupContent(popup);
-                        } else {
-                            markers[id] = L.marker([lat, lon], { icon }).addTo(map).bindPopup(popup);
-                        }
-                        statusEl.innerText = `🟢 Živě: ${Object.keys(markers).length} vozů v okolí Kolejní`;
-                    } else if (markers[id]) {
-                        // Pokud vůz vyjel z okruhu 1,5 km, smažeme ho z mapy
-                        map.removeLayer(markers[id]);
-                        delete markers[id];
-                    }
-                } catch (e) {}
+                    let lon = data.geometry.x;
+                    let lat = data.geometry.y;
+                    updateVehicleOnMap(lat, lon, data.attributes || {});
+                } catch (err) {}
             };
 
-            ws.onerror = () => {
-                statusEl.innerText = '❌ Chyba WebSocket spojení se serverem gis.brno.cz';
+            ws.onerror = (err) => {
+                statusEl.innerText = '❌ WebSocket ohlásil chybu';
                 statusEl.style.color = '#b00000';
+                addLog(JSON.stringify({ triedWsUrl: wsUrl, serverMeta: metaInfo }, null, 2));
             };
 
-            ws.onclose = () => {
-                statusEl.innerText = '⏳ Spojení přerušeno, zkusím znovu za 5s...';
-                statusEl.style.color = '#d9534f';
-                setTimeout(connectStream, 5000);
+            ws.onclose = (ev) => {
+                statusEl.innerText = `🔴 Spojení ukončeno (kód: ${ev.code})`;
+                statusEl.style.color = '#b00000';
+                addLog(JSON.stringify({ closeCode: ev.code, reason: ev.reason, triedWsUrl: wsUrl }, null, 2));
             };
         }
 
-        connectStream();
+        async function startRestPolling(serviceUrl) {
+            let layerUrl = serviceUrl.replace(/\/+$/, '');
+            if (!/\/\d+$/.test(layerUrl)) layerUrl += '/0';
 
-        // Úspora dat: při minimalizaci prohlížeče odpojí stream
-        document.addEventListener("visibilitychange", () => {
-            if (document.visibilityState === 'hidden' && ws) {
-                ws.close();
-            } else if (document.visibilityState === 'visible' && (!ws || ws.readyState === WebSocket.CLOSED)) {
-                connectStream();
+            async function poll() {
+                if (document.visibilityState === 'hidden') return;
+                try {
+                    const res = await fetch(`${layerUrl}/query?where=1%3D1&outFields=*&outSR=4326&f=json`);
+                    const data = await res.json();
+                    if (data.error) throw data.error;
+                    (data.features || []).forEach(f => {
+                        if (f.geometry) updateVehicleOnMap(f.geometry.y, f.geometry.x, f.attributes || {});
+                    });
+                    logEl.innerText = '';
+                } catch (e) {
+                    statusEl.innerText = '❌ Chyba dotazu na FeatureServer';
+                    addLog(JSON.stringify({ layerUrl, error: e }, null, 2));
+                }
             }
-        });
-    </script>
-</body>
-</html>
+            poll();
+            setInterval(poll, 15000);
+        }
+        
