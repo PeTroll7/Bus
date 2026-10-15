@@ -8,7 +8,6 @@
     <style>
         body { margin: 0; padding: 0; }
         #map { width: 100vw; height: 100vh; }
-        /* Panel pro zobrazení stavu na mobilu */
         #status { 
             position: absolute; 
             top: 10px; 
@@ -58,15 +57,10 @@
 
             const baseUrl = 'https://services6.arcgis.com/fUWVlHWZNxUvTUh8/arcgis/rest/services/Polohy_vozidel_DPMB/FeatureServer/0/query';
             
+            // Zjednodušený dotaz bez prostorového ořezávání (zamezí chybě 400)
             const params = new URLSearchParams({
-                where: '1=1', // Oprava: Vynucení dotazu pro ArcGIS server
+                where: '1=1',
                 f: 'geojson',
-                geometryType: 'esriGeometryPoint',
-                geometry: `${LON},${LAT}`,
-                spatialRel: 'esriSpatialRelIntersects',
-                distance: '2000', // Zvětšeno na 2 km pro testovací účely
-                units: 'esriSRUnit_Meter',
-                inSR: '4326',
                 outSR: '4326',
                 outFields: '*'
             });
@@ -80,36 +74,48 @@
                 
                 const data = await response.json();
 
-                // Pokud ArcGIS vrátí chybovou hlášku v JSON struktuře
                 if (data.error) {
                     throw new Error(data.error.message);
                 }
 
                 vehiclesLayer.clearLayers();
+                let count = 0;
 
-                if (data.features && data.features.length > 0) {
-                    statusDiv.innerText = `Aktualizováno (vozidel: ${data.features.length})`;
-                    statusDiv.style.color = 'green';
-                    
+                if (data.features) {
                     data.features.forEach(vehicle => {
+                        // Přeskočení vozidel, která nemají GPS signál
+                        if (!vehicle.geometry || !vehicle.geometry.coordinates) return;
+
                         const coords = vehicle.geometry.coordinates;
                         const props = vehicle.properties;
                         
-                        const marker = L.circleMarker([coords[1], coords[0]], {
-                            color: 'blue',
-                            fillOpacity: 0.8,
-                            radius: 6
-                        });
+                        // Výpočet vzdálenosti od zastávky Kolejní přímo v prohlížeči
+                        const distance = map.distance([LAT, LON], [coords[1], coords[0]]);
                         
-                        let popupText = `<b>Linka:</b> ${props.LineName || props.LineId || 'Neznámá'}<br>`;
-                        if (props.Delay !== undefined) popupText += `<b>Zpoždění:</b> ${props.Delay} min`;
-                        
-                        marker.bindPopup(popupText);
-                        vehiclesLayer.addLayer(marker);
+                        // Zobrazení pouze pokud je vzdálenost menší nebo rovna 2000 metrů
+                        if (distance <= 2000) {
+                            count++;
+                            const marker = L.circleMarker([coords[1], coords[0]], {
+                                color: 'blue',
+                                fillOpacity: 0.8,
+                                radius: 6
+                            });
+                            
+                            let popupText = `<b>Linka:</b> ${props.LineName || props.LineId || 'Neznámá'}<br>`;
+                            if (props.Delay !== undefined) popupText += `<b>Zpoždění:</b> ${props.Delay} min`;
+                            
+                            marker.bindPopup(popupText);
+                            vehiclesLayer.addLayer(marker);
+                        }
                     });
-                } else {
-                    statusDiv.innerText = 'Žádné vozy v okruhu 2 km';
-                    statusDiv.style.color = 'orange';
+                    
+                    if (count > 0) {
+                        statusDiv.innerText = `Aktualizováno (vozidel: ${count})`;
+                        statusDiv.style.color = 'green';
+                    } else {
+                        statusDiv.innerText = 'Žádné vozy v okruhu 2 km';
+                        statusDiv.style.color = 'orange';
+                    }
                 }
             } catch (err) {
                 statusDiv.innerText = 'Chyba: ' + err.message;
