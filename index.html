@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MHD Brno - Kolejní 1km</title>
+    <!-- Lehká mapová knihovna Leaflet -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; }
+        #map { width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Souřadnice zastávky Kolejní
+        const LAT = 49.2316;
+        const LON = 16.5745;
+        
+        // Inicializace mapy s restrikcemi pro šetření dat
+        const map = L.map('map', {
+            center: [LAT, LON],
+            zoom: 15,
+            minZoom: 14, // Zabrání odzoomování a stažení dlaždic pro celé město
+            maxZoom: 18,
+            maxBounds: [[49.21, 16.55], [49.25, 16.60]] // Omezí posun mapy pouze na okolí Kolejní
+        });
+
+        // OpenStreetMap podklad (prohlížeče tuto vrstvu agresivně kešují)
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // Značka středu (zastávka Kolejní)
+        L.circleMarker([LAT, LON], { color: 'red', radius: 8 }).addTo(map).bindPopup('<b>Zastávka Kolejní</b>');
+
+        // Vrstva pro autobusy/tramvaje
+        const vehiclesLayer = L.layerGroup().addTo(map);
+
+        // Funkce pro získání ořezaných dat
+        async function fetchVehicles() {
+            // Pokud aplikace běží na pozadí, nestahuj žádná data
+            if (document.visibilityState === 'hidden') return;
+
+            // URL vrstvy z datového portálu Brna
+            // (pozn. URL ID "fUWVlHWZNxUvTUh8" je globální prostor pro brněnská data)
+            const baseUrl = 'https://services6.arcgis.com/fUWVlHWZNxUvTUh8/arcgis/rest/services/Polohy_vozidel_DPMB/FeatureServer/0/query';
+            
+            // Konfigurace dotazu na server pro minimalizaci odpovědi
+            const params = new URLSearchParams({
+                f: 'geojson',
+                geometryType: 'esriGeometryPoint',
+                geometry: `${LON},${LAT}`,
+                spatialRel: 'esriSpatialRelIntersects',
+                distance: '1000', // Poloměr 1 km
+                units: 'esriSRUnit_Meter',
+                inSR: '4326',
+                outSR: '4326',
+                outFields: '*', // Pro další úsporu dat lze nahradit např. 'LineName,Delay' podle dokumentace API
+                geometryPrecision: '5' // Zkrátí desetinná místa
+            });
+
+            try {
+                const response = await fetch(`${baseUrl}?${params.toString()}`);
+                const data = await response.json();
+
+                // Vyčištění mapy od starých poloh
+                vehiclesLayer.clearLayers();
+
+                // Vykreslení aktuálních poloh vozidel
+                if (data.features) {
+                    data.features.forEach(vehicle => {
+                        const coords = vehicle.geometry.coordinates;
+                        const props = vehicle.properties;
+                        
+                        const marker = L.circleMarker([coords[1], coords[0]], {
+                            color: 'blue',
+                            fillOpacity: 0.8,
+                            radius: 6
+                        });
+                        
+                        // Zobrazení všech dostupných informací po kliknutí
+                        // (pázvy properties se mohou v API mírně lišit, např. LineID, LineName)
+                        let popupText = `<b>Linka:</b> ${props.LineName || props.LineId || 'Neznámá'}<br>`;
+                        if (props.Delay !== undefined) {
+                            popupText += `<b>Zpoždění:</b> ${props.Delay} min`;
+                        }
+                        
+                        marker.bindPopup(popupText);
+                        vehiclesLayer.addLayer(marker);
+                    });
+                }
+            } catch (err) {
+                console.error("Chyba spojení s data.brno.cz", err);
+            }
+        }
+
+        // První načtení
+        fetchVehicles();
+
+        // Stahování nových poloh každých 20 sekund
+        setInterval(fetchVehicles, 20000);
+
+        // Pokud uživatel vrátil záložku do popředí, okamžitě aktualizuj
+        document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState === 'visible') {
+                fetchVehicles();
+            }
+        });
+    </script>
+</body>
+</html>
