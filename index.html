@@ -3,72 +3,34 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MHD Brno - Kolejní (Diagnostika)</title>
+    <title>MHD Kolejní - Živý Stream</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
         body { margin: 0; padding: 0; font-family: sans-serif; }
         #map { width: 100vw; height: 100vh; }
-        
-        /* Plovoucí panel pro stav a kompletní výpis chyb */
-        #debug-panel {
-            position: absolute;
-            top: 10px;
-            left: 50px;
-            right: 10px;
-            max-height: 45vh;
-            overflow-y: auto;
-            z-index: 1000;
-            background: rgba(255, 255, 255, 0.95);
-            padding: 10px 12px;
-            border: 2px solid #333;
-            border-radius: 6px;
-            font-size: 13px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        #status {
+            position: absolute; top: 10px; left: 50px; right: 10px; z-index: 1000;
+            background: rgba(255,255,255,0.95); padding: 8px 12px;
+            border-radius: 6px; border: 2px solid #333; font-size: 13px; font-weight: bold;
         }
-        #status-title { font-weight: bold; margin-bottom: 4px; }
-        #error-log {
-            white-space: pre-wrap;
-            word-break: break-all;
-            font-family: monospace;
-            font-size: 11px;
-            color: #b00000;
-            margin: 0;
-            display: none;
-            border-top: 1px solid #ccc;
-            padding-top: 6px;
-            margin-top: 6px;
-        }
-        .vehicle-label {
-            background: #0056b3;
-            color: white;
-            border-radius: 4px;
-            padding: 2px 5px;
-            font-size: 11px;
-            font-weight: bold;
-            border: 1px solid white;
-            white-space: nowrap;
+        .bus-icon {
+            background: #0056b3; color: #fff; border-radius: 4px; padding: 2px 5px;
+            font-size: 11px; font-weight: bold; border: 1px solid #fff; white-space: nowrap;
         }
     </style>
 </head>
 <body>
-    <div id="debug-panel">
-        <div id="status-title">Inicializace aplikace...</div>
-        <pre id="error-log"></pre>
-    </div>
+    <div id="status">Připojuji se k živému streamu Brna...</div>
     <div id="map"></div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
-        // Souřadnice zastávky Kolejní
         const LAT = 49.2316;
         const LON = 16.5745;
-        const RADIUS_METERS = 1500; // Okruh 1,5 km kolem zastávky
+        const RADIUS = 1500; // 1,5 km kolem Kolejní
 
         const map = L.map('map', {
-            center: [LAT, LON],
-            zoom: 15,
-            minZoom: 13,
-            maxZoom: 18,
+            center: [LAT, LON], zoom: 15, minZoom: 13, maxZoom: 18,
             maxBounds: [[49.19, 16.50], [49.27, 16.65]]
         });
 
@@ -76,152 +38,95 @@
             attribution: '© OpenStreetMap'
         }).addTo(map);
 
-        // Zvýraznění zastávky Kolejní a vymezení sledovaného okruhu
         L.circleMarker([LAT, LON], { color: '#d9534f', fillOpacity: 1, radius: 7 })
-            .addTo(map)
-            .bindPopup('<b>Zastávka Kolejní</b>');
+            .addTo(map).bindPopup('<b>Zastávka Kolejní</b>');
+        L.circle([LAT, LON], { color: '#d9534f', weight: 1, fillOpacity: 0.05, radius: RADIUS }).addTo(map);
 
-        L.circle([LAT, LON], { color: '#d9534f', weight: 1, fillOpacity: 0.05, radius: RADIUS_METERS })
-            .addTo(map);
+        const statusEl = document.getElementById('status');
+        const markers = {}; // Uchovává aktivní vozy podle jejich ID
 
-        const vehiclesLayer = L.layerGroup().addTo(map);
-        const statusTitle = document.getElementById('status-title');
-        const errorLog = document.getElementById('error-log');
+        // Výpočet obdélníku (BBOX) kolem Kolejní, aby server posílal jen blízká vozidla
+        const latD = RADIUS / 111320;
+        const lonD = RADIUS / (111320 * Math.cos(LAT * Math.PI / 180));
+        const filterEnvelope = {
+            xmin: LON - lonD, ymin: LAT - latD,
+            xmax: LON + lonD, ymax: LAT + latD,
+            spatialReference: { wkid: 4326 }
+        };
 
-        function showError(title, detailObj) {
-            statusTitle.innerText = '❌ ' + title;
-            statusTitle.style.color = '#b00000';
-            errorLog.style.display = 'block';
-            errorLog.innerText = typeof detailObj === 'string' 
-                ? detailObj 
-                : JSON.stringify(detailObj, null, 2);
-        }
+        let ws;
+        function connectStream() {
+            // Oficiální WebSocket StreamServer města Brna (KORDIS)
+            const wsUrl = 'wss://gis.brno.cz/ags4/rest/services/stream_kordis_26/StreamServer/subscribe?outSR=4326';
+            ws = new WebSocket(wsUrl);
 
-        function showSuccess(text) {
-            statusTitle.innerText = '✅ ' + text;
-            statusTitle.style.color = '#198754';
-            errorLog.style.display = 'none';
-            errorLog.innerText = '';
-        }
+            ws.onopen = () => {
+                statusEl.innerText = '🟢 Připojeno – čekám na pohyb vozidel v okolí...';
+                statusEl.style.color = '#198754';
+                // Požádáme server, aby filtroval data jen pro okolí Kolejní
+                ws.send(JSON.stringify({ filter: { geometry: filterEnvelope } }));
+            };
 
-        // Seznam možných oficiálních endpointů města Brna (záložní řešení při přejmenování služby)
-        const ENDPOINTS = [
-            'https://services6.arcgis.com/fUWVlHWZNxUvTUh8/arcgis/rest/services/Polohy_vozidel/FeatureServer/0/query',
-            'https://services6.arcgis.com/fUWVlHWZNxUvTUh8/arcgis/rest/services/Polohy_vozidel_DPMB/FeatureServer/0/query'
-        ];
-
-        async function fetchFromArcGIS(baseUrl) {
-            // Používáme nativní formát f=json místo f=geojson (geojson na některých ArcGIS serverech hází chybu 400)
-            const url = `${baseUrl}?where=1%3D1&outFields=*&outSR=4326&f=json`;
-            const response = await fetch(url);
-            const rawText = await response.text();
-
-            let data;
-            try {
-                data = JSON.parse(rawText);
-            } catch (e) {
-                throw {
-                    httpStatus: response.status,
-                    url: url,
-                    error: 'Odpověď není platný JSON',
-                    rawResponse: rawText.substring(0, 500)
-                };
-            }
-
-            if (!response.ok || data.error) {
-                throw {
-                    httpStatus: response.status,
-                    url: url,
-                    arcgisError: data.error || data
-                };
-            }
-
-            return data;
-        }
-
-        async function updateVehicles() {
-            if (document.visibilityState === 'hidden') return;
-
-            statusTitle.innerText = '⏳ Stahuji polohy vozidel...';
-            statusTitle.style.color = '#333';
-
-            let data = null;
-            let errors = [];
-
-            // Vyzkouší endpointy postupně, pokud první selže
-            for (const endpoint of ENDPOINTS) {
+            ws.onmessage = (event) => {
                 try {
-                    data = await fetchFromArcGIS(endpoint);
-                    if (data && (data.features || data.geojson)) break;
-                } catch (err) {
-                    errors.push(err);
-                }
-            }
+                    const data = JSON.parse(event.data);
+                    if (!data.geometry) return;
 
-            if (!data) {
-                showError('Nepodařilo se stáhnout data ze serveru', errors);
-                return;
-            }
+                    const lon = data.geometry.x;
+                    const lat = data.geometry.y;
+                    if (!lat || !lon) return;
 
-            vehiclesLayer.clearLayers();
-            const features = data.features || [];
-            let countInRadius = 0;
+                    const dist = map.distance([LAT, LON], [lat, lon]);
+                    const props = data.attributes || {};
+                    const id = props.ID || props.VehicleId || props.id || `${ props.LineName }_${ props.Course }`;
 
-            features.forEach(item => {
-                // Podpora pro standardní Esri JSON (geometry.x / y) i GeoJSON (geometry.coordinates)
-                let lat, lon;
-                if (item.geometry) {
-                    if (item.geometry.y !== undefined && item.geometry.x !== undefined) {
-                        lat = item.geometry.y;
-                        lon = item.geometry.x;
-                    } else if (Array.isArray(item.geometry.coordinates)) {
-                        lon = item.geometry.coordinates[0];
-                        lat = item.geometry.coordinates[1];
+                    if (dist <= RADIUS) {
+                        const line = props.LineName || props.line_name || props.LineId || '?';
+                        const delay = props.Delay ?? props.delay ?? 0;
+                        const finalStop = props.FinalStopName || '';
+
+                        const icon = L.divIcon({
+                            className: '',
+                            html: `<div class="bus-icon">${line}</div>`,
+                            iconSize: [28, 18], iconAnchor: [14, 9]
+                        });
+
+                        const popup = `<b>Linka ${line}</b><br>Směr: ${finalStop}<br>Zpoždění: ${delay} min`;
+
+                        if (markers[id]) {
+                            markers[id].setLatLng([lat, lon]).setIcon(icon).setPopupContent(popup);
+                        } else {
+                            markers[id] = L.marker([lat, lon], { icon }).addTo(map).bindPopup(popup);
+                        }
+                        statusEl.innerText = `🟢 Živě: ${Object.keys(markers).length} vozů v okolí Kolejní`;
+                    } else if (markers[id]) {
+                        // Pokud vůz vyjel z okruhu 1,5 km, smažeme ho z mapy
+                        map.removeLayer(markers[id]);
+                        delete markers[id];
                     }
-                }
+                } catch (e) {}
+            };
 
-                if (!lat || !lon) return;
+            ws.onerror = () => {
+                statusEl.innerText = '❌ Chyba WebSocket spojení se serverem gis.brno.cz';
+                statusEl.style.color = '#b00000';
+            };
 
-                const dist = map.distance([LAT, LON], [lat, lon]);
-                if (dist <= RADIUS_METERS) {
-                    countInRadius++;
-                    const props = item.attributes || item.properties || {};
-
-                    // Různé názvy polí podle verze API města Brna
-                    const line = props.LineName || props.line_name || props.LineId || props.ID || '?';
-                    const finalStop = props.FinalStopName || props.final_stop || '';
-                    const delay = props.Delay !== undefined ? props.Delay : (props.delay !== undefined ? props.delay : null);
-
-                    const icon = L.divIcon({
-                        className: '',
-                        html: `<div class="vehicle-label">${line}</div>`,
-                        iconSize: [28, 18],
-                        iconAnchor: [14, 9]
-                    });
-
-                    const marker = L.marker([lat, lon], { icon: icon });
-
-                    // Vypíše všechny surové vlastnosti po kliknutí na vozidlo
-                    let popupHtml = `<b>Linka: ${line}</b><br>`;
-                    if (finalStop) popupHtml += `Směr: ${finalStop}<br>`;
-                    if (delay !== null) popupHtml += `Zpoždění: ${delay} min<br>`;
-                    popupHtml += `<hr><small>Vzdálenost: ${Math.round(dist)} m</small>`;
-
-                    marker.bindPopup(popupHtml);
-                    vehiclesLayer.addLayer(marker);
-                }
-            });
-
-            const timeStr = new Date().toLocaleTimeString('cs-CZ');
-            showSuccess(`OK (${timeStr}) – V okolí: ${countInRadius} z ${features.length} vozů v Brně`);
+            ws.onclose = () => {
+                statusEl.innerText = '⏳ Spojení přerušeno, zkusím znovu za 5s...';
+                statusEl.style.color = '#d9534f';
+                setTimeout(connectStream, 5000);
+            };
         }
 
-        updateVehicles();
-        setInterval(updateVehicles, 20000);
+        connectStream();
 
+        // Úspora dat: při minimalizaci prohlížeče odpojí stream
         document.addEventListener("visibilitychange", () => {
-            if (document.visibilityState === 'visible') {
-                updateVehicles();
+            if (document.visibilityState === 'hidden' && ws) {
+                ws.close();
+            } else if (document.visibilityState === 'visible' && (!ws || ws.readyState === WebSocket.CLOSED)) {
+                connectStream();
             }
         });
     </script>
